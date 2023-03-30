@@ -1,4 +1,7 @@
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
 
 // -------------------------------------------------------------------------------------------------
 
@@ -6,8 +9,23 @@ fn main() {
     let expr = gen_rand_expr();
     println!("{expr}\n");
 
-    let ssa = Compiler::compile(expr);
+    let ssa = Compiler::compile(&expr);
     println!("{ssa}\n");
+
+    let expr_result = expr.eval();
+    println!("EXPR RESULT: {expr_result}");
+
+    let ssa_result = ssa.eval();
+    println!("EXPR RESULT: {expr_result}");
+
+    println!(
+        "\n{}",
+        if expr_result == ssa_result {
+            "SUCCESS"
+        } else {
+            "FAILURE"
+        }
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -26,6 +44,22 @@ impl Display for Expr {
             Expr::Number(n) => write!(f, "{n}"),
             Expr::Add(l, r) => write!(f, "(+ {l} {r})"),
             Expr::Cond(c, i, e) => write!(f, "(if {c} {i} {e})"),
+        }
+    }
+}
+
+impl Expr {
+    fn eval(&self) -> i64 {
+        match self {
+            Expr::Number(n) => *n,
+            Expr::Add(l, r) => l.eval() + r.eval(),
+            Expr::Cond(c, i, e) => {
+                if c.eval() != 0 {
+                    i.eval()
+                } else {
+                    e.eval()
+                }
+            }
         }
     }
 }
@@ -114,12 +148,52 @@ impl Display for Instruction {
 #[derive(Clone, Copy, Debug)]
 struct Const(i64);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Register(u64);
 
 impl Display for Register {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "%{}", self.0)
+    }
+}
+
+impl Ssa {
+    fn eval(&self) -> i64 {
+        let mut regs = HashMap::new();
+        self.eval_block(&mut regs, 0)
+    }
+
+    fn eval_block(&self, regs: &mut HashMap<Register, i64>, block_idx: BlockIdx) -> i64 {
+        self.blocks[block_idx]
+            .instrs
+            .iter()
+            .map(|instr| match instr {
+                Instruction::Add(d, l, r) => {
+                    let result = regs.get(&l).unwrap() + regs.get(&r).unwrap();
+                    regs.insert(*d, result);
+                    result
+                }
+                Instruction::Br(i) => self.eval_block(regs, *i),
+                Instruction::Cbr(c, tr, fa) => {
+                    if *regs.get(&c).unwrap() != 0 {
+                        self.eval_block(regs, *tr)
+                    } else {
+                        self.eval_block(regs, *fa)
+                    }
+                }
+                Instruction::Move(d, s) => {
+                    let result = *regs.get(&s).unwrap();
+                    regs.insert(*d, result);
+                    result
+                }
+                Instruction::Movi(d, c) => {
+                    regs.insert(*d, c.0);
+                    c.0
+                }
+                Instruction::Ret(r) => *regs.get(r).unwrap(),
+            })
+            .last()
+            .unwrap()
     }
 }
 
@@ -135,7 +209,7 @@ struct Compiler {
 // -------------------------------------------------------------------------------------------------
 
 impl Compiler {
-    fn compile(expr: Expr) -> Ssa {
+    fn compile(expr: &Expr) -> Ssa {
         let mut compiler = Compiler::new();
 
         let result_reg = compiler.compile_expr(expr);
@@ -155,30 +229,30 @@ impl Compiler {
         }
     }
 
-    fn compile_expr(&mut self, expr: Expr) -> Register {
+    fn compile_expr(&mut self, expr: &Expr) -> Register {
         match expr {
             Expr::Number(n) => {
                 let instr_reg = self.next_reg();
-                self.append_instr(Instruction::Movi(instr_reg, Const(n)));
+                self.append_instr(Instruction::Movi(instr_reg, Const(*n)));
                 instr_reg
             }
             Expr::Add(l, r) => {
-                let l_reg = self.compile_expr(*l);
-                let r_reg = self.compile_expr(*r);
+                let l_reg = self.compile_expr(l);
+                let r_reg = self.compile_expr(r);
                 let instr_reg = self.next_reg();
                 self.append_instr(Instruction::Add(instr_reg, l_reg, r_reg));
                 instr_reg
             }
             Expr::Cond(c, t, f) => {
-                let c_reg = self.compile_expr(*c);
+                let c_reg = self.compile_expr(c);
                 let c_end_block_idx = self.cur_block_idx;
 
                 let t_begin_block_idx = self.new_block();
-                let t_reg = self.compile_expr(*t);
+                let t_reg = self.compile_expr(t);
                 let t_end_block_idx = self.cur_block_idx;
 
                 let f_begin_block_idx = self.new_block();
-                let f_reg = self.compile_expr(*f);
+                let f_reg = self.compile_expr(f);
                 let f_end_block_idx = self.cur_block_idx;
 
                 self.append_instr_to(
