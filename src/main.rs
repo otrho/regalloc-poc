@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::{Display, Formatter},
 };
 
@@ -8,27 +8,31 @@ use std::{
 fn main() {
     let expr = gen_rand_expr();
     println!("{expr}\n");
-
-    let mut ssa = Compiler::compile(&expr);
-    println!("{ssa}\n");
-
     let expr_result = expr.eval();
-    println!("EXPR RESULT: {expr_result}");
 
+    let ssa = IrCompiler::compile(&expr);
+    println!("{ssa}\n");
     let ssa_result = ssa.eval();
-    println!("SSA RESULT: {expr_result}");
 
-    if let Err(msg) = ssa.reg_alloc() {
-        println!("REG ALLOC FAILED: {msg}");
-        return;
-    }
+    let asm = AsmCompiler::compile(&ssa);
+    println!("{asm}");
+    let abstract_asm_result = asm.eval();
 
-    let asm_result = ssa.eval();
-    println!("ASM RESULT: {asm_result}");
+    //    if let Err(msg) = ssa.reg_alloc() {
+    //        println!("REG ALLOC FAILED: {msg}");
+    //        return;
+    //    }
+    //
+    //    let asm_result = ssa.eval();
+    //    println!("ASM RESULT: {asm_result}");
+
+    println!("EXPR RESULT: {expr_result}");
+    println!("SSA RESULT: {ssa_result}");
+    println!("ABSTRACT ASM RESULT: {abstract_asm_result}");
 
     println!(
         "\n{}",
-        if expr_result == ssa_result && ssa_result == asm_result {
+        if expr_result == ssa_result && ssa_result == abstract_asm_result {
             "SUCCESS"
         } else {
             "FAILURE"
@@ -37,7 +41,7 @@ fn main() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Simple expression.
+// Expr: Simple expression. {{{
 
 #[derive(Debug)]
 enum Expr {
@@ -97,65 +101,371 @@ fn gen_rand_expr() -> Expr {
     *helper(0)
 }
 
+// }}}
 // -------------------------------------------------------------------------------------------------
-// SSA representation.  It's not strictly SSA since we don't have PHI nodes nor block params so PHI
-// values are def'd from multiple blocks before branching to a common successor.
+// Ssa: Intermediate representation.  {{{
 
 #[derive(Debug)]
 struct Ssa {
+    values: Vec<Value>,
+    instrs: Vec<Instruction>,
     blocks: Vec<Block>,
 }
 
 impl Display for Ssa {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        for (i, b) in self.blocks.iter().enumerate() {
-            write!(f, "\nblock{i}:\n{b}")?;
-        }
-        Ok(())
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
     }
 }
 
 #[derive(Debug)]
 struct Block {
-    instrs: Vec<Instruction>,
+    arg: Option<ValueIdx>,
+    instr_vals: Vec<ValueIdx>,
 }
 
 type BlockIdx = usize;
 
-impl Display for Block {
+#[derive(Debug)]
+enum Instruction {
+    Add(ValueIdx, ValueIdx),
+    Br(BlockIdx, Option<ValueIdx>),
+    Cbr(
+        ValueIdx,
+        BlockIdx,
+        Option<ValueIdx>,
+        BlockIdx,
+        Option<ValueIdx>,
+    ),
+    Ret(ValueIdx),
+}
+
+type InstructionIdx = usize;
+
+#[derive(Debug)]
+enum Value {
+    Instruction(BlockIdx, InstructionIdx),
+    Argument(BlockIdx),
+    Const(i64),
+}
+
+type ValueIdx = usize;
+
+impl Ssa {
+    fn to_string(&self) -> String {
+        let val_str = |val_idx: ValueIdx| {
+            if let Value::Const(n) = self.values[val_idx] {
+                format!("{n}")
+            } else {
+                format!("%{val_idx}")
+            }
+        };
+
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(block_idx, block)| {
+                let instrs_str = block
+                    .instr_vals
+                    .iter()
+                    .map(|instr_val_idx| {
+                        if let Value::Instruction(_block_idx, instr_idx) =
+                            self.values[*instr_val_idx]
+                        {
+                            format!(
+                                "    {}",
+                                match self.instrs[instr_idx] {
+                                    Instruction::Add(l_idx, r_idx) => format!(
+                                        "%{instr_val_idx} = add {} {}",
+                                        val_str(l_idx),
+                                        val_str(r_idx)
+                                    ),
+                                    Instruction::Br(block_idx, arg_idx) => format!(
+                                        "br block{block_idx}({})",
+                                        arg_idx.map(|i| val_str(i)).unwrap_or(String::new())
+                                    ),
+                                    Instruction::Cbr(
+                                        cond_val_idx,
+                                        t_block_idx,
+                                        t_arg_idx,
+                                        f_block_idx,
+                                        f_arg_idx,
+                                    ) => format!(
+                                        "cbr {} \
+                                         block{t_block_idx}({}) \
+                                         block{f_block_idx}({})",
+                                        val_str(cond_val_idx),
+                                        t_arg_idx.map(|i| val_str(i)).unwrap_or(String::new()),
+                                        f_arg_idx.map(|i| val_str(i)).unwrap_or(String::new()),
+                                    ),
+                                    Instruction::Ret(ret_val_idx) =>
+                                        format!("ret {}", val_str(ret_val_idx)),
+                                }
+                            )
+                        } else {
+                            unreachable!("Non instruction value in instruction list.")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                format!(
+                    "block{block_idx}({}):\n{}",
+                    block
+                        .arg
+                        .map(|arg_val_idx| format!("%{arg_val_idx}"))
+                        .unwrap_or(String::new()),
+                    instrs_str
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn eval(&self) -> i64 {
+        let mut vals = HashMap::new();
+        self.eval_block(&mut vals, 0, None)
+    }
+
+    fn eval_block(
+        &self,
+        vals: &mut HashMap<ValueIdx, i64>,
+        block_idx: BlockIdx,
+        arg_val: Option<i64>,
+    ) -> i64 {
+        if let Some(arg_val_idx) = self.blocks[block_idx].arg {
+            vals.insert(arg_val_idx, arg_val.unwrap());
+        }
+
+        fn resolve_val(
+            ssa_vals: &[Value],
+            vals: &HashMap<ValueIdx, i64>,
+            val_idx: ValueIdx,
+        ) -> i64 {
+            vals.get(&val_idx).cloned().unwrap_or_else(|| {
+                if let Value::Const(n) = ssa_vals[val_idx] {
+                    n
+                } else {
+                    unreachable!("Unable to resolve value %{val_idx}.")
+                }
+            })
+        }
+
+        macro_rules! resolve_val {
+            ($val_idx: ident) => {
+                resolve_val(&self.values, vals, $val_idx)
+            };
+        }
+
+        self.blocks[block_idx]
+            .instr_vals
+            .iter()
+            .map(|instr_val_idx| {
+                if let Value::Instruction(_block_idx, instr_idx) = self.values[*instr_val_idx] {
+                    match self.instrs[instr_idx] {
+                        Instruction::Add(l_val_idx, r_val_idx) => {
+                            let result = resolve_val!(l_val_idx) + resolve_val!(r_val_idx);
+                            vals.insert(*instr_val_idx, result);
+                            result
+                        }
+                        Instruction::Br(block_idx, arg_val_idx) => {
+                            self.eval_block(vals, block_idx, arg_val_idx.map(|i| resolve_val!(i)))
+                        }
+                        Instruction::Cbr(
+                            c_val_idx,
+                            tr_block_idx,
+                            tr_arg_val_idx,
+                            fa_block_idx,
+                            fa_arg_val_idx,
+                        ) => {
+                            if resolve_val!(c_val_idx) != 0 {
+                                self.eval_block(
+                                    vals,
+                                    tr_block_idx,
+                                    tr_arg_val_idx.map(|i| resolve_val!(i)),
+                                )
+                            } else {
+                                self.eval_block(
+                                    vals,
+                                    fa_block_idx,
+                                    fa_arg_val_idx.map(|i| resolve_val!(i)),
+                                )
+                            }
+                        }
+                        Instruction::Ret(ret_val_idx) => resolve_val!(ret_val_idx),
+                    }
+                } else {
+                    unreachable!("Non instruction value in instruction list.")
+                }
+            })
+            .last()
+            .unwrap()
+    }
+}
+
+// }}}
+// -------------------------------------------------------------------------------------------------
+// IrCompiler: Expr -> Ssa Compiler {{{
+
+struct IrCompiler {
+    values: Vec<Value>,
+    instrs: Vec<Instruction>,
+    blocks: Vec<Block>,
+
+    cur_block_idx: usize,
+}
+
+// -------------------------------------------------------------------------------------------------
+
+impl IrCompiler {
+    fn compile(expr: &Expr) -> Ssa {
+        let mut compiler = IrCompiler::new();
+
+        let result_val = compiler.compile_expr(expr);
+        compiler.append_instr(Instruction::Ret(result_val));
+
+        Ssa {
+            values: compiler.values,
+            instrs: compiler.instrs,
+            blocks: compiler.blocks,
+        }
+    }
+
+    fn new() -> Self {
+        let blocks = vec![Block {
+            arg: None,
+            instr_vals: Vec::new(),
+        }];
+        IrCompiler {
+            blocks,
+            values: Vec::new(),
+            instrs: Vec::new(),
+            cur_block_idx: 0,
+        }
+    }
+
+    fn compile_expr(&mut self, expr: &Expr) -> ValueIdx {
+        match expr {
+            Expr::Number(n) => {
+                let val_idx = self.values.len();
+                self.values.push(Value::Const(*n));
+                val_idx
+            }
+            Expr::Add(l, r) => {
+                let l_val_idx = self.compile_expr(l);
+                let r_val_idx = self.compile_expr(r);
+                self.append_instr(Instruction::Add(l_val_idx, r_val_idx))
+            }
+            Expr::Cond(c, t, f) => {
+                let c_val_idx = self.compile_expr(c);
+                let c_end_block_idx = self.cur_block_idx;
+
+                let t_begin_block_idx = self.new_block();
+                let t_val_idx = self.compile_expr(t);
+                let t_end_block_idx = self.cur_block_idx;
+
+                let f_begin_block_idx = self.new_block();
+                let f_val_idx = self.compile_expr(f);
+                let f_end_block_idx = self.cur_block_idx;
+
+                self.append_instr_to(
+                    c_end_block_idx,
+                    Instruction::Cbr(c_val_idx, t_begin_block_idx, None, f_begin_block_idx, None),
+                );
+
+                let (j_block_idx, j_block_arg_idx) = self.new_block_with_arg();
+                self.append_instr_to(
+                    t_end_block_idx,
+                    Instruction::Br(j_block_idx, Some(t_val_idx)),
+                );
+                self.append_instr_to(
+                    f_end_block_idx,
+                    Instruction::Br(j_block_idx, Some(f_val_idx)),
+                );
+                j_block_arg_idx
+            }
+        }
+    }
+
+    fn new_block(&mut self) -> BlockIdx {
+        let idx = self.blocks.len();
+        self.blocks.push(Block {
+            instr_vals: Vec::new(),
+            arg: None,
+        });
+        self.cur_block_idx = idx;
+        idx
+    }
+
+    fn new_block_with_arg(&mut self) -> (BlockIdx, ValueIdx) {
+        let block_idx = self.blocks.len();
+        let arg_val_idx = self.values.len();
+        self.values.push(Value::Argument(block_idx));
+        self.blocks.push(Block {
+            instr_vals: Vec::new(),
+            arg: Some(arg_val_idx),
+        });
+        self.cur_block_idx = block_idx;
+        (block_idx, arg_val_idx)
+    }
+
+    fn append_instr(&mut self, instr: Instruction) -> ValueIdx {
+        self.append_instr_to(self.cur_block_idx, instr)
+    }
+
+    fn append_instr_to(&mut self, block_idx: usize, instr: Instruction) -> ValueIdx {
+        let instr_idx = self.instrs.len();
+        self.instrs.push(instr);
+
+        let instr_val_idx = self.values.len();
+        self.values.push(Value::Instruction(block_idx, instr_idx));
+
+        self.blocks[block_idx].instr_vals.push(instr_val_idx);
+        instr_val_idx
+    }
+}
+
+// }}}
+// -------------------------------------------------------------------------------------------------
+// Asm: Assembly code {{{
+
+struct Asm {
+    opcodes: Vec<Opcode>,
+}
+
+impl Display for Asm {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        for i in &self.instrs {
-            write!(f, "    {i}\n")?;
+        for op in &self.opcodes {
+            match op {
+                Opcode::BlockBegin(idx) => write!(f, "block_begin_{idx}\n")?,
+                Opcode::BlockEnd(idx) => write!(f, "block_end_{idx}\n\n")?,
+                Opcode::Add(d, l, r) => write!(f, "    add {d} {l} {r}\n")?,
+                Opcode::Move(d, s) => write!(f, "    mov {d} {s}\n")?,
+                Opcode::Movi(d, i) => write!(f, "    mov {d} {i}\n")?,
+                Opcode::JmpBlockBegin(idx) => write!(f, "    jmp block_begin_{idx}\n")?,
+                Opcode::JmpBlockEnd(idx) => write!(f, "    jmp block_end_{idx}\n")?,
+                Opcode::JzBlockBegin(r, idx) => write!(f, "    jz {r} block_begin_{idx}\n")?,
+                Opcode::Ret(r) => write!(f, "    ret {r}\n")?,
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Debug)]
-enum Instruction {
+enum Opcode {
+    BlockBegin(BlockIdx),
+    BlockEnd(BlockIdx),
+
     Add(Register, Register, Register),
-    Br(BlockIdx),
-    Cbr(Register, BlockIdx, BlockIdx),
     Move(Register, Register),
-    Movi(Register, Const),
+    Movi(Register, i64),
+
+    JmpBlockBegin(BlockIdx),
+    JmpBlockEnd(BlockIdx),
+    JzBlockBegin(Register, BlockIdx),
+
     Ret(Register),
 }
-
-impl Display for Instruction {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Instruction::Add(d, l, r) => write!(f, "add {d} {l} {r}"),
-            Instruction::Br(i) => write!(f, "br block{i}"),
-            Instruction::Cbr(c, tr, fa) => write!(f, "cbr {c} block{tr} block{fa}"),
-            Instruction::Move(d, s) => write!(f, "mov {d} {s}"),
-            Instruction::Movi(d, c) => write!(f, "mov {d} {}", c.0),
-            Instruction::Ret(r) => write!(f, "ret {r}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Const(i64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Register(u64);
@@ -166,45 +476,204 @@ impl Display for Register {
     }
 }
 
-impl Ssa {
+impl Asm {
     fn eval(&self) -> i64 {
-        let mut regs = HashMap::new();
-        self.eval_block(&mut regs, 0)
-    }
-
-    fn eval_block(&self, regs: &mut HashMap<Register, i64>, block_idx: BlockIdx) -> i64 {
-        self.blocks[block_idx]
-            .instrs
+        // For now the ASM only ever jumps forward, so instead of having a PC and jumping around
+        // arbitrarily we have a 'skip state' which skips instructions until a desired label is
+        // found.
+        let mut regs: HashMap<Register, i64> = HashMap::new();
+        self.opcodes
             .iter()
-            .map(|instr| match instr {
-                Instruction::Add(d, l, r) => {
-                    let result = regs.get(&l).unwrap() + regs.get(&r).unwrap();
-                    regs.insert(*d, result);
-                    result
-                }
-                Instruction::Br(i) => self.eval_block(regs, *i),
-                Instruction::Cbr(c, tr, fa) => {
-                    if *regs.get(&c).unwrap() != 0 {
-                        self.eval_block(regs, *tr)
+            .fold((None, None), |(result, skip_idx), op| {
+                if result.is_some() {
+                    (result, None)
+                } else {
+                    if let Some((target_idx, begin)) = skip_idx {
+                        match op {
+                            Opcode::BlockBegin(block_idx) if block_idx == target_idx && begin => {
+                                (None, None)
+                            }
+                            Opcode::BlockEnd(block_idx) if block_idx == target_idx && !begin => {
+                                (None, None)
+                            }
+                            _ => (None, skip_idx),
+                        }
                     } else {
-                        self.eval_block(regs, *fa)
+                        match op {
+                            Opcode::BlockBegin(_) => (None, None),
+                            Opcode::BlockEnd(_) => (None, None),
+                            Opcode::Add(d, l, r) => {
+                                let sum = regs.get(l).unwrap() + regs.get(r).unwrap();
+                                regs.insert(*d, sum);
+                                (None, None)
+                            }
+                            Opcode::Move(d, s) => {
+                                regs.insert(*d, regs.get(s).copied().unwrap());
+                                (None, None)
+                            }
+                            Opcode::Movi(d, i) => {
+                                regs.insert(*d, *i);
+                                (None, None)
+                            }
+                            Opcode::JmpBlockBegin(idx) => (None, Some((idx, true))),
+                            Opcode::JmpBlockEnd(idx) => (None, Some((idx, false))),
+                            Opcode::JzBlockBegin(c, idx) => {
+                                if regs.get(c).copied().unwrap() == 0 {
+                                    (None, Some((idx, true)))
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            Opcode::Ret(ret_reg) => (regs.get(ret_reg).copied(), None),
+                        }
                     }
                 }
-                Instruction::Move(d, s) => {
-                    let result = *regs.get(&s).unwrap();
-                    regs.insert(*d, result);
-                    result
-                }
-                Instruction::Movi(d, c) => {
-                    regs.insert(*d, c.0);
-                    c.0
-                }
-                Instruction::Ret(r) => *regs.get(r).unwrap(),
             })
-            .last()
+            .0
             .unwrap()
     }
+}
 
+// }}}
+// -------------------------------------------------------------------------------------------------
+// AsmCompiler: Ssa -> Asm Compiler {{{
+
+struct AsmCompiler {
+    opcodes: Vec<Opcode>,
+
+    next_reg_idx: u64,
+    reg_map: HashMap<ValueIdx, Register>,
+}
+
+impl AsmCompiler {
+    fn compile(ssa: &Ssa) -> Asm {
+        AsmCompiler::new().compile_ssa(ssa)
+    }
+
+    fn new() -> Self {
+        AsmCompiler {
+            opcodes: Vec::new(),
+            next_reg_idx: 0,
+            reg_map: HashMap::new(),
+        }
+    }
+
+    fn compile_ssa(mut self, ssa: &Ssa) -> Asm {
+        for (idx, block) in ssa.blocks.iter().enumerate() {
+            self.compile_block(ssa, block, idx);
+        }
+
+        Asm {
+            opcodes: self.opcodes,
+        }
+    }
+
+    fn compile_block(&mut self, ssa: &Ssa, block: &Block, block_idx: BlockIdx) {
+        self.opcodes.push(Opcode::BlockBegin(block_idx));
+        for instr_val_idx in &block.instr_vals {
+            let Value::Instruction(_block_idx, instr_idx) = ssa.values[*instr_val_idx] else {
+                unreachable!("Block instruction value not an instruction.");
+            };
+
+            macro_rules! get_reg {
+                ($val_idx: ident) => {
+                    self.reg_map.get(&$val_idx).copied().unwrap()
+                };
+            }
+            macro_rules! get_reg_or_new {
+                ($val_idx: ident) => {
+                    if self.reg_map.contains_key(&$val_idx) {
+                        self.reg_map.get(&$val_idx).copied().unwrap()
+                    } else {
+                        let reg = self.next_reg();
+                        self.reg_map.insert($val_idx, reg);
+                        reg
+                    }
+                };
+            }
+
+            let instr_reg = self.next_reg();
+            match ssa.instrs[instr_idx] {
+                Instruction::Add(l_val_idx, r_val_idx) => {
+                    self.compile_const(ssa, l_val_idx);
+                    self.compile_const(ssa, r_val_idx);
+                    self.opcodes.push(Opcode::Add(
+                        instr_reg,
+                        get_reg!(l_val_idx),
+                        get_reg!(r_val_idx),
+                    ));
+                }
+                Instruction::Br(block_idx, block_arg) => {
+                    if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
+                        (ssa.blocks[block_idx].arg, block_arg)
+                    {
+                        let dst_arg_reg = get_reg_or_new!(block_arg_val_idx);
+                        let src_arg_reg = get_reg!(branch_arg_val_idx);
+                        self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
+                    }
+                    self.opcodes.push(Opcode::JmpBlockBegin(block_idx));
+                }
+                Instruction::Cbr(
+                    c_val_idx,
+                    tr_block_idx,
+                    tr_block_arg,
+                    fa_block_idx,
+                    fa_block_arg,
+                ) => {
+                    self.compile_const(ssa, c_val_idx);
+
+                    if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
+                        (ssa.blocks[fa_block_idx].arg, fa_block_arg)
+                    {
+                        let dst_arg_reg = get_reg_or_new!(block_arg_val_idx);
+                        let src_arg_reg = get_reg!(branch_arg_val_idx);
+                        self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
+                    }
+                    self.opcodes
+                        .push(Opcode::JzBlockBegin(get_reg!(c_val_idx), fa_block_idx));
+
+                    if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
+                        (ssa.blocks[tr_block_idx].arg, tr_block_arg)
+                    {
+                        let dst_arg_reg = get_reg_or_new!(block_arg_val_idx);
+                        let src_arg_reg = get_reg!(branch_arg_val_idx);
+                        self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
+                    }
+                    self.compile_block(ssa, &ssa.blocks[tr_block_idx], tr_block_idx);
+                    self.opcodes.push(Opcode::JmpBlockEnd(fa_block_idx));
+
+                    self.compile_block(ssa, &ssa.blocks[fa_block_idx], fa_block_idx);
+                }
+                Instruction::Ret(ret_val_idx) => {
+                    self.opcodes.push(Opcode::Ret(get_reg!(ret_val_idx)));
+                }
+            }
+            self.reg_map.insert(*instr_val_idx, instr_reg);
+        }
+        self.opcodes.push(Opcode::BlockEnd(block_idx));
+    }
+
+    fn compile_const(&mut self, ssa: &Ssa, val_idx: ValueIdx) {
+        if let Value::Const(n) = ssa.values[val_idx] {
+            let const_reg = self.next_reg();
+            self.opcodes.push(Opcode::Movi(const_reg, n));
+            self.reg_map.insert(val_idx, const_reg);
+        }
+    }
+
+    fn next_reg(&mut self) -> Register {
+        let reg_idx = self.next_reg_idx;
+        self.next_reg_idx += 1;
+        Register(reg_idx)
+    }
+}
+
+// }}}
+// -------------------------------------------------------------------------------------------------
+// First attempt at SSA reg alloc {{{
+
+/*
+{
     fn reg_alloc(&mut self) -> Result<(), String> {
         use regalloc2::{PReg, RegClass};
 
@@ -456,102 +925,6 @@ impl regalloc2::Function for SsaMeta {
         1
     }
 }
-
-// -------------------------------------------------------------------------------------------------
-
-struct Compiler {
-    blocks: Vec<Block>,
-    cur_block_idx: usize,
-
-    next_reg_idx: u64,
-}
-
-// -------------------------------------------------------------------------------------------------
-
-impl Compiler {
-    fn compile(expr: &Expr) -> Ssa {
-        let mut compiler = Compiler::new();
-
-        let result_reg = compiler.compile_expr(expr);
-        compiler.append_instr(Instruction::Ret(result_reg));
-
-        Ssa {
-            blocks: compiler.blocks,
-        }
-    }
-
-    fn new() -> Self {
-        let blocks = vec![Block { instrs: Vec::new() }];
-        Compiler {
-            blocks,
-            cur_block_idx: 0,
-            next_reg_idx: 0,
-        }
-    }
-
-    fn compile_expr(&mut self, expr: &Expr) -> Register {
-        match expr {
-            Expr::Number(n) => {
-                let instr_reg = self.next_reg();
-                self.append_instr(Instruction::Movi(instr_reg, Const(*n)));
-                instr_reg
-            }
-            Expr::Add(l, r) => {
-                let l_reg = self.compile_expr(l);
-                let r_reg = self.compile_expr(r);
-                let instr_reg = self.next_reg();
-                self.append_instr(Instruction::Add(instr_reg, l_reg, r_reg));
-                instr_reg
-            }
-            Expr::Cond(c, t, f) => {
-                let c_reg = self.compile_expr(c);
-                let c_end_block_idx = self.cur_block_idx;
-
-                let t_begin_block_idx = self.new_block();
-                let t_reg = self.compile_expr(t);
-                let t_end_block_idx = self.cur_block_idx;
-
-                let f_begin_block_idx = self.new_block();
-                let f_reg = self.compile_expr(f);
-                let f_end_block_idx = self.cur_block_idx;
-
-                self.append_instr_to(
-                    c_end_block_idx,
-                    Instruction::Cbr(c_reg, t_begin_block_idx, f_begin_block_idx),
-                );
-
-                let j_block_idx = self.new_block();
-                let instr_reg = self.next_reg();
-                self.append_instr_to(t_end_block_idx, Instruction::Move(instr_reg, t_reg));
-                self.append_instr_to(t_end_block_idx, Instruction::Br(j_block_idx));
-                self.append_instr_to(f_end_block_idx, Instruction::Move(instr_reg, f_reg));
-                self.append_instr_to(f_end_block_idx, Instruction::Br(j_block_idx));
-
-                instr_reg
-            }
-        }
-    }
-
-    fn new_block(&mut self) -> BlockIdx {
-        let idx = self.blocks.len();
-        self.blocks.push(Block { instrs: Vec::new() });
-        self.cur_block_idx = idx;
-        idx
-    }
-
-    fn append_instr(&mut self, instr: Instruction) {
-        self.append_instr_to(self.cur_block_idx, instr)
-    }
-
-    fn append_instr_to(&mut self, block_idx: usize, instr: Instruction) {
-        self.blocks[block_idx].instrs.push(instr);
-    }
-
-    fn next_reg(&mut self) -> Register {
-        let reg_idx = self.next_reg_idx;
-        self.next_reg_idx += 1;
-        Register(reg_idx)
-    }
-}
-
+*/
+// }}}
 // -------------------------------------------------------------------------------------------------
