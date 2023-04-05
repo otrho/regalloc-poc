@@ -14,25 +14,34 @@ fn main() {
     println!("{ssa}\n");
     let ssa_result = ssa.eval();
 
-    let asm = AsmCompiler::compile(&ssa);
+    let mut asm = AsmCompiler::compile(&ssa);
     println!("{asm}");
     let abstract_asm_result = asm.eval();
 
-    //    if let Err(msg) = ssa.reg_alloc() {
-    //        println!("REG ALLOC FAILED: {msg}");
-    //        return;
-    //    }
-    //
-    //    let asm_result = ssa.eval();
-    //    println!("ASM RESULT: {asm_result}");
+    let mut alloctr = AsmRegAllocator::new(&mut asm);
+    if let Err(msg) = alloctr.reg_alloc() {
+        println!("REG ALLOC FAILED: {msg}");
+        return;
+    }
+    println!("{asm}");
+    let allocd_asm_result = asm.eval();
 
     println!("EXPR RESULT: {expr_result}");
     println!("SSA RESULT: {ssa_result}");
     println!("ABSTRACT ASM RESULT: {abstract_asm_result}");
+    println!("ALLOC'D ASM RESULT: {allocd_asm_result}");
 
     println!(
         "\n{}",
-        if expr_result == ssa_result && ssa_result == abstract_asm_result {
+        if [
+            expr_result,
+            ssa_result,
+            abstract_asm_result,
+            allocd_asm_result
+        ]
+        .windows(2)
+        .all(|results| results[0] == results[1])
+        {
             "SUCCESS"
         } else {
             "FAILURE"
@@ -85,16 +94,16 @@ fn gen_rand_expr() -> Expr {
         let new_cond = || Expr::Cond(helper(depth + 1), helper(depth + 1), helper(depth + 1));
 
         let r = rand::random::<i64>() % 100;
-        Box::new(if depth < 2 {
-            if r < 5 {
-                new_cond()
-            } else {
-                new_arith_op()
-            }
-        } else if depth < 4 {
-            new_arith_op()
-        } else {
+        Box::new(if depth > 8 {
             new_number()
+        } else {
+            if r < 20 {
+                new_cond()
+            } else if r < 60 {
+                new_arith_op()
+            } else {
+                new_number()
+            }
         })
     }
 
@@ -431,48 +440,108 @@ impl IrCompiler {
 
 struct Asm {
     opcodes: Vec<Opcode>,
+    num_regs: usize,
 }
 
 impl Display for Asm {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        for op in &self.opcodes {
+        for (op_idx, op) in self.opcodes.iter().enumerate() {
             match op {
-                Opcode::BlockBegin(idx) => write!(f, "block_begin_{idx}\n")?,
-                Opcode::BlockEnd(idx) => write!(f, "block_end_{idx}\n\n")?,
-                Opcode::Add(d, l, r) => write!(f, "    add {d} {l} {r}\n")?,
-                Opcode::Move(d, s) => write!(f, "    mov {d} {s}\n")?,
-                Opcode::Movi(d, i) => write!(f, "    mov {d} {i}\n")?,
-                Opcode::JmpBlockBegin(idx) => write!(f, "    jmp block_begin_{idx}\n")?,
-                Opcode::JmpBlockEnd(idx) => write!(f, "    jmp block_end_{idx}\n")?,
-                Opcode::JzBlockBegin(r, idx) => write!(f, "    jz {r} block_begin_{idx}\n")?,
-                Opcode::Ret(r) => write!(f, "    ret {r}\n")?,
+                Opcode::Label(idx) => write!(f, "{op_idx:>3} label_{idx}:\n")?,
+                Opcode::Add(d, l, r) => write!(f, "{op_idx:>3}     add {d} {l} {r}\n")?,
+                Opcode::Move(d, s) => write!(f, "{op_idx:>3}     mov {d} {s}\n")?,
+                Opcode::Movi(d, i) => write!(f, "{op_idx:>3}     mov {d} {i}\n")?,
+                Opcode::Jmp(idx) => write!(f, "{op_idx:>3}     jmp label_{idx}\n")?,
+                Opcode::Jz(r, idx) => write!(f, "{op_idx:>3}     jz {r} label_{idx}\n")?,
+                Opcode::Ret(r) => write!(f, "{op_idx:>3}     ret {r}\n")?,
+                Opcode::Load(d, i) => write!(f, "{op_idx:>3}     load {d} {i}\n")?,
+                Opcode::Store(i, s) => write!(f, "{op_idx:>3}     store {i} {s}\n")?,
             }
         }
         Ok(())
     }
 }
 
+#[derive(Clone, Debug)]
 enum Opcode {
-    BlockBegin(BlockIdx),
-    BlockEnd(BlockIdx),
+    Label(LabelIdx),
 
-    Add(Register, Register, Register),
-    Move(Register, Register),
-    Movi(Register, i64),
+    Add(Operand, Operand, Operand),
+    Move(Operand, Operand),
+    Movi(Operand, i64),
 
-    JmpBlockBegin(BlockIdx),
-    JmpBlockEnd(BlockIdx),
-    JzBlockBegin(Register, BlockIdx),
+    Jmp(LabelIdx),
+    Jz(Operand, LabelIdx),
 
-    Ret(Register),
+    Ret(Operand),
+
+    Load(Operand, Operand),  // reg, stack
+    Store(Operand, Operand), // stack, reg
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Register(u64);
+type LabelIdx = usize;
 
-impl Display for Register {
+impl Opcode {
+    fn rewrite_opcode_operand_register(&mut self, operand_idx: usize, reg_idx: usize) {
+        self.rewrite_opcode_operand(operand_idx, Operand::Register(reg_idx))
+    }
+
+    fn _rewrite_opcode_operand_stack(&mut self, operand_idx: usize, slot_idx: usize) {
+        self.rewrite_opcode_operand(operand_idx, Operand::Stack(slot_idx))
+    }
+
+    fn rewrite_opcode_operand(&mut self, operand_idx: usize, operand: Operand) {
+        let opand_ref = match self {
+            Opcode::Label(_) => unreachable!("Label has no operands"),
+            Opcode::Add(a, b, c) => match operand_idx {
+                0 => a,
+                1 => b,
+                2 => c,
+                _ => unreachable!(),
+            },
+            Opcode::Move(a, b) => match operand_idx {
+                0 => a,
+                1 => b,
+                _ => unreachable!(),
+            },
+            Opcode::Movi(a, _) => match operand_idx {
+                0 => a,
+                _ => unreachable!(),
+            },
+            Opcode::Jmp(_) => unreachable!("Jmp has no operands"),
+            Opcode::Jz(a, _) => match operand_idx {
+                0 => a,
+                _ => unreachable!(),
+            },
+            Opcode::Ret(a) => match operand_idx {
+                0 => a,
+                _ => unreachable!(),
+            },
+            Opcode::Load(a, _) => match operand_idx {
+                0 => a,
+                _ => unreachable!(),
+            },
+            Opcode::Store(_, a) => match operand_idx {
+                1 => a,
+                _ => unreachable!(),
+            },
+        };
+        *opand_ref = operand;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Operand {
+    Register(usize),
+    Stack(usize),
+}
+
+impl Display for Operand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "%{}", self.0)
+        match self {
+            Operand::Register(r) => write!(f, "%{r}"),
+            Operand::Stack(s) => write!(f, "[{s}]"),
+        }
     }
 }
 
@@ -481,50 +550,65 @@ impl Asm {
         // For now the ASM only ever jumps forward, so instead of having a PC and jumping around
         // arbitrarily we have a 'skip state' which skips instructions until a desired label is
         // found.
-        let mut regs: HashMap<Register, i64> = HashMap::new();
+        let mut regs: HashMap<usize, i64> = HashMap::new();
+        let mut stack: HashMap<usize, i64> = HashMap::new();
+
+        macro_rules! greg {
+            ($r: ident) => {
+                regs.get($r).copied().unwrap()
+            };
+        }
+
         self.opcodes
             .iter()
             .fold((None, None), |(result, skip_idx), op| {
                 if result.is_some() {
                     (result, None)
                 } else {
-                    if let Some((target_idx, begin)) = skip_idx {
+                    if let Some(target_idx) = skip_idx {
                         match op {
-                            Opcode::BlockBegin(block_idx) if block_idx == target_idx && begin => {
-                                (None, None)
-                            }
-                            Opcode::BlockEnd(block_idx) if block_idx == target_idx && !begin => {
-                                (None, None)
-                            }
+                            Opcode::Label(label_idx) if label_idx == target_idx => (None, None),
                             _ => (None, skip_idx),
                         }
                     } else {
                         match op {
-                            Opcode::BlockBegin(_) => (None, None),
-                            Opcode::BlockEnd(_) => (None, None),
-                            Opcode::Add(d, l, r) => {
-                                let sum = regs.get(l).unwrap() + regs.get(r).unwrap();
+                            Opcode::Label(_) => (None, None),
+                            Opcode::Add(
+                                Operand::Register(d),
+                                Operand::Register(l),
+                                Operand::Register(r),
+                            ) => {
+                                let sum = greg!(l) + greg!(r);
                                 regs.insert(*d, sum);
                                 (None, None)
                             }
-                            Opcode::Move(d, s) => {
-                                regs.insert(*d, regs.get(s).copied().unwrap());
+                            Opcode::Move(Operand::Register(d), Operand::Register(s)) => {
+                                regs.insert(*d, greg!(s));
                                 (None, None)
                             }
-                            Opcode::Movi(d, i) => {
+                            Opcode::Movi(Operand::Register(d), i) => {
                                 regs.insert(*d, *i);
                                 (None, None)
                             }
-                            Opcode::JmpBlockBegin(idx) => (None, Some((idx, true))),
-                            Opcode::JmpBlockEnd(idx) => (None, Some((idx, false))),
-                            Opcode::JzBlockBegin(c, idx) => {
-                                if regs.get(c).copied().unwrap() == 0 {
-                                    (None, Some((idx, true)))
+                            Opcode::Jmp(idx) => (None, Some(idx)),
+                            Opcode::Jz(Operand::Register(c), idx) => {
+                                if greg!(c) == 0 {
+                                    (None, Some(idx))
                                 } else {
                                     (None, None)
                                 }
                             }
-                            Opcode::Ret(ret_reg) => (regs.get(ret_reg).copied(), None),
+                            Opcode::Ret(Operand::Register(r)) => (Some(greg!(r)), None),
+                            Opcode::Load(Operand::Register(d), Operand::Stack(slot)) => {
+                                regs.insert(*d, stack.get(slot).copied().unwrap());
+                                (None, None)
+                            }
+                            Opcode::Store(Operand::Stack(slot), Operand::Register(s)) => {
+                                stack.insert(*slot, greg!(s));
+                                (None, None)
+                            }
+
+                            _ => todo!("Eval {op:?}"),
                         }
                     }
                 }
@@ -541,8 +625,11 @@ impl Asm {
 struct AsmCompiler {
     opcodes: Vec<Opcode>,
 
-    next_reg_idx: u64,
-    reg_map: HashMap<ValueIdx, Register>,
+    next_reg_idx: usize,
+    reg_map: HashMap<ValueIdx, Operand>,
+
+    next_label_idx: LabelIdx,
+    label_map: HashMap<BlockIdx, LabelIdx>,
 }
 
 impl AsmCompiler {
@@ -553,8 +640,10 @@ impl AsmCompiler {
     fn new() -> Self {
         AsmCompiler {
             opcodes: Vec::new(),
-            next_reg_idx: 0,
+            next_reg_idx: 1000,
             reg_map: HashMap::new(),
+            next_label_idx: 0,
+            label_map: HashMap::new(),
         }
     }
 
@@ -565,20 +654,24 @@ impl AsmCompiler {
 
         Asm {
             opcodes: self.opcodes,
+            num_regs: self.next_reg_idx as usize,
         }
     }
 
     fn compile_block(&mut self, ssa: &Ssa, block: &Block, block_idx: BlockIdx) {
-        self.opcodes.push(Opcode::BlockBegin(block_idx));
+        let label_idx = self.label_idx_for_block(block_idx);
+        self.opcodes.push(Opcode::Label(label_idx));
+
         for instr_val_idx in &block.instr_vals {
             let Value::Instruction(_block_idx, instr_idx) = ssa.values[*instr_val_idx] else {
                 unreachable!("Block instruction value not an instruction.");
             };
 
             macro_rules! get_reg {
-                ($val_idx: ident) => {
+                ($val_idx: ident) => {{
+                    self.compile_const(ssa, $val_idx);
                     self.reg_map.get(&$val_idx).copied().unwrap()
-                };
+                }};
             }
             macro_rules! get_reg_or_new {
                 ($val_idx: ident) => {
@@ -595,13 +688,9 @@ impl AsmCompiler {
             let instr_reg = self.next_reg();
             match ssa.instrs[instr_idx] {
                 Instruction::Add(l_val_idx, r_val_idx) => {
-                    self.compile_const(ssa, l_val_idx);
-                    self.compile_const(ssa, r_val_idx);
-                    self.opcodes.push(Opcode::Add(
-                        instr_reg,
-                        get_reg!(l_val_idx),
-                        get_reg!(r_val_idx),
-                    ));
+                    let l_reg = get_reg!(l_val_idx);
+                    let r_reg = get_reg!(r_val_idx);
+                    self.opcodes.push(Opcode::Add(instr_reg, l_reg, r_reg));
                 }
                 Instruction::Br(block_idx, block_arg) => {
                     if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
@@ -611,7 +700,8 @@ impl AsmCompiler {
                         let src_arg_reg = get_reg!(branch_arg_val_idx);
                         self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
                     }
-                    self.opcodes.push(Opcode::JmpBlockBegin(block_idx));
+                    let block_label_idx = self.label_idx_for_block(block_idx);
+                    self.opcodes.push(Opcode::Jmp(block_label_idx));
                 }
                 Instruction::Cbr(
                     c_val_idx,
@@ -620,8 +710,6 @@ impl AsmCompiler {
                     fa_block_idx,
                     fa_block_arg,
                 ) => {
-                    self.compile_const(ssa, c_val_idx);
-
                     if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
                         (ssa.blocks[fa_block_idx].arg, fa_block_arg)
                     {
@@ -629,8 +717,10 @@ impl AsmCompiler {
                         let src_arg_reg = get_reg!(branch_arg_val_idx);
                         self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
                     }
-                    self.opcodes
-                        .push(Opcode::JzBlockBegin(get_reg!(c_val_idx), fa_block_idx));
+                    let fa_block_label_idx = self.label_idx_for_block(fa_block_idx);
+
+                    let c_reg = get_reg!(c_val_idx);
+                    self.opcodes.push(Opcode::Jz(c_reg, fa_block_label_idx));
 
                     if let (Some(block_arg_val_idx), Some(branch_arg_val_idx)) =
                         (ssa.blocks[tr_block_idx].arg, tr_block_arg)
@@ -639,18 +729,16 @@ impl AsmCompiler {
                         let src_arg_reg = get_reg!(branch_arg_val_idx);
                         self.opcodes.push(Opcode::Move(dst_arg_reg, src_arg_reg));
                     }
-                    self.compile_block(ssa, &ssa.blocks[tr_block_idx], tr_block_idx);
-                    self.opcodes.push(Opcode::JmpBlockEnd(fa_block_idx));
-
-                    self.compile_block(ssa, &ssa.blocks[fa_block_idx], fa_block_idx);
+                    let tr_block_label_idx = self.label_idx_for_block(tr_block_idx);
+                    self.opcodes.push(Opcode::Jmp(tr_block_label_idx));
                 }
                 Instruction::Ret(ret_val_idx) => {
-                    self.opcodes.push(Opcode::Ret(get_reg!(ret_val_idx)));
+                    let r_reg = get_reg!(ret_val_idx);
+                    self.opcodes.push(Opcode::Ret(r_reg));
                 }
             }
             self.reg_map.insert(*instr_val_idx, instr_reg);
         }
-        self.opcodes.push(Opcode::BlockEnd(block_idx));
     }
 
     fn compile_const(&mut self, ssa: &Ssa, val_idx: ValueIdx) {
@@ -661,25 +749,155 @@ impl AsmCompiler {
         }
     }
 
-    fn next_reg(&mut self) -> Register {
+    fn next_reg(&mut self) -> Operand {
         let reg_idx = self.next_reg_idx;
         self.next_reg_idx += 1;
-        Register(reg_idx)
+        Operand::Register(reg_idx)
+    }
+
+    fn label_idx_for_block(&mut self, block_idx: BlockIdx) -> LabelIdx {
+        *self.label_map.entry(block_idx).or_insert_with(|| {
+            let label_idx = self.next_label_idx;
+            self.next_label_idx += 1;
+            label_idx
+        })
     }
 }
 
 // }}}
 // -------------------------------------------------------------------------------------------------
-// First attempt at SSA reg alloc {{{
+// AsmRegAllocator: Abstract Asm -> Allocated Asm Transformer {{{
 
-/*
-{
+struct AsmRegAllocator<'a> {
+    asm: &'a mut Asm,
+    block_bounds: Vec<regalloc2::InstRange>,
+    entry_block: regalloc2::Block,
+    block_succs: HashMap<usize, Vec<regalloc2::Block>>,
+    block_preds: HashMap<usize, Vec<regalloc2::Block>>,
+    dummy_block_params: Vec<regalloc2::VReg>,
+    inst_operands: HashMap<usize, Vec<regalloc2::Operand>>,
+    num_vregs: usize,
+}
+
+impl<'a> AsmRegAllocator<'a> {
+    fn new(asm: &'a mut Asm) -> AsmRegAllocator {
+        let label_offsets = asm
+            .opcodes
+            .iter()
+            .chain(std::iter::once(&Opcode::Label(usize::MAX)))
+            .enumerate()
+            .filter_map(|(op_idx, op)| {
+                if let Opcode::Label(label_idx) = op {
+                    Some((op_idx, label_idx))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let block_bounds = label_offsets
+            .windows(2)
+            .map(|label_pairs| {
+                regalloc2::InstRange::forward(
+                    regalloc2::Inst::new(label_pairs[0].0),
+                    regalloc2::Inst::new(label_pairs[1].0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let label_map: HashMap<usize, usize> = HashMap::from_iter(
+            (0..block_bounds.len())
+                .zip(label_offsets)
+                .map(|(block_idx, (_, label_idx))| (*label_idx, block_idx)),
+        );
+
+        let mut block_succs: HashMap<usize, Vec<regalloc2::Block>> = HashMap::new();
+        let mut block_preds: HashMap<usize, Vec<regalloc2::Block>> = HashMap::new();
+        block_succs.insert(block_bounds.len() - 1, Vec::new());
+        block_preds.insert(0, Vec::new());
+
+        let mut inst_operands: HashMap<usize, Vec<regalloc2::Operand>> = HashMap::new();
+
+        let mut cur_block_idx = 0_usize;
+        for (op_idx, op) in asm.opcodes.iter().enumerate() {
+            match op {
+                Opcode::Label(idx) => {
+                    inst_operands.insert(op_idx, Vec::new());
+                    cur_block_idx = *label_map.get(idx).unwrap();
+                }
+                Opcode::Add(a, b, c) => {
+                    inst_operands.insert(
+                        op_idx,
+                        vec![Self::new_def(a), Self::new_use(b), Self::new_use(c)],
+                    );
+                }
+                Opcode::Move(a, b) => {
+                    inst_operands.insert(op_idx, vec![Self::new_def(a), Self::new_use(b)]);
+                }
+                Opcode::Movi(a, _) => {
+                    inst_operands.insert(op_idx, vec![Self::new_def(a)]);
+                }
+                Opcode::Jmp(label_idx) => {
+                    inst_operands.insert(op_idx, Vec::new());
+
+                    let dst_block_idx = label_map.get(label_idx).copied().unwrap();
+                    let dst_block = regalloc2::Block::new(dst_block_idx);
+                    block_succs
+                        .entry(cur_block_idx)
+                        .and_modify(|v| v.push(dst_block))
+                        .or_insert(vec![dst_block]);
+                    let cur_block = regalloc2::Block::new(cur_block_idx);
+                    block_preds
+                        .entry(dst_block_idx)
+                        .and_modify(|v| v.push(cur_block))
+                        .or_insert(vec![cur_block]);
+                }
+                Opcode::Jz(a, label_idx) => {
+                    inst_operands.insert(op_idx, vec![Self::new_use(a)]);
+
+                    let dst_block_idx = label_map.get(label_idx).copied().unwrap();
+                    let dst_block = regalloc2::Block::new(dst_block_idx);
+                    block_succs
+                        .entry(cur_block_idx)
+                        .and_modify(|v| v.push(dst_block))
+                        .or_insert(vec![dst_block]);
+                    let cur_block = regalloc2::Block::new(cur_block_idx);
+                    block_preds
+                        .entry(dst_block_idx)
+                        .and_modify(|v| v.push(cur_block))
+                        .or_insert(vec![cur_block]);
+                }
+                Opcode::Ret(r) => {
+                    inst_operands.insert(op_idx, vec![Self::new_use(r)]);
+                }
+                Opcode::Load(d, _) => {
+                    inst_operands.insert(op_idx, vec![Self::new_def(d)]);
+                }
+                Opcode::Store(_, s) => {
+                    inst_operands.insert(op_idx, vec![Self::new_use(s)]);
+                }
+            }
+        }
+
+        let entry_block = regalloc2::Block::new(0);
+        let num_vregs = asm.num_regs;
+
+        AsmRegAllocator {
+            asm,
+            block_bounds,
+            entry_block,
+            block_succs,
+            block_preds,
+            dummy_block_params: Vec::new(),
+            inst_operands,
+            num_vregs,
+        }
+    }
+
     fn reg_alloc(&mut self) -> Result<(), String> {
-        use regalloc2::{PReg, RegClass};
-
         let env = regalloc2::MachineEnv {
             preferred_regs_by_class: [
-                (16..64).map(|i| PReg::new(i, RegClass::Int)).collect(),
+                (16..20)
+                    .map(|i| regalloc2::PReg::new(i, regalloc2::RegClass::Int))
+                    .collect(),
                 Vec::new(),
             ],
             non_preferred_regs_by_class: [Vec::new(), Vec::new()],
@@ -688,180 +906,88 @@ impl AsmCompiler {
 
         let opts = regalloc2::RegallocOptions {
             verbose_log: true,
-            validate_ssa: true,
+            validate_ssa: false,
         };
 
-        let ssa_meta = SsaMeta::new(self);
-        let _alloc_output = regalloc2::run(&ssa_meta, &env, &opts).map_err(|e| format!("{e}"))?;
+        let alloc_output = regalloc2::run(self, &env, &opts).map_err(|e| format!("{e}"))?;
+        let new_opcodes = (0..self.block_bounds.len())
+            .flat_map(|block_idx| {
+                alloc_output
+                    .block_insts_and_edits(self, regalloc2::Block::new(block_idx))
+                    .filter_map(|edit_or_inst| self.allocate_opcode(&alloc_output, edit_or_inst))
+            })
+            .collect();
+
+        self.asm.opcodes = new_opcodes;
 
         Ok(())
     }
-}
 
-struct SsaMeta {
-    num_insts: usize,
-    num_blocks: usize,
-    entry_block: regalloc2::Block,
-    block_instr_ranges: HashMap<regalloc2::Block, regalloc2::InstRange>,
-    block_succs: HashMap<usize, Vec<regalloc2::Block>>,
-    block_preds: HashMap<usize, Vec<regalloc2::Block>>,
-    dummy_block_params: Vec<regalloc2::VReg>,
-    ret_set: HashSet<usize>,
-    branch_set: HashSet<usize>,
-    moves: HashMap<usize, (regalloc2::Operand, regalloc2::Operand)>,
-    inst_operands: HashMap<usize, Vec<regalloc2::Operand>>,
-    num_regs: usize,
-    empty_block_set: Vec<regalloc2::Block>,
-}
-
-impl SsaMeta {
-    fn new(ssa: &Ssa) -> Self {
-        let num_insts = ssa.blocks.iter().map(|block| block.instrs.len()).sum();
-        let num_blocks = ssa.blocks.len();
-        let entry_block = regalloc2::Block::new(0);
-        let block_instr_ranges =
-            HashMap::from_iter(ssa.blocks.iter().enumerate().scan(0, |acc, (i, b)| {
-                let begin_idx = regalloc2::Inst::new(*acc);
-                let end_idx = regalloc2::Inst::new(*acc + b.instrs.len() - 1);
-                *acc += b.instrs.len();
-                Some((
-                    regalloc2::Block::new(i),
-                    regalloc2::InstRange::forward(begin_idx, end_idx),
-                ))
-            }));
-
-        let mut block_succs: HashMap<usize, Vec<regalloc2::Block>> = HashMap::new();
-        let mut block_preds: HashMap<usize, Vec<regalloc2::Block>> = HashMap::new();
-        let mut add_succ_pred = |succ_idx, pred_idx| {
-            let succ = regalloc2::Block::new(succ_idx);
-            block_succs
-                .entry(pred_idx)
-                .and_modify(|succs| succs.push(succ))
-                .or_insert(vec![succ]);
-
-            let pred = regalloc2::Block::new(pred_idx);
-            block_preds
-                .entry(succ_idx)
-                .and_modify(|preds| preds.push(pred))
-                .or_insert(vec![pred]);
-        };
-        for (idx, block) in ssa.blocks.iter().enumerate() {
-            match block.instrs.last() {
-                Some(Instruction::Br(dst)) => {
-                    add_succ_pred(*dst, idx);
-                }
-                Some(Instruction::Cbr(_, tr_dst, fa_dst)) => {
-                    add_succ_pred(*tr_dst, idx);
-                    add_succ_pred(*fa_dst, idx);
-                }
-                Some(Instruction::Ret(_)) => {}
-
-                _ => unreachable!("Bad terminator for block."),
+    fn allocate_opcode(
+        &self,
+        alloc_output: &regalloc2::Output,
+        edit_or_inst: regalloc2::InstOrEdit,
+    ) -> Option<Opcode> {
+        match edit_or_inst {
+            regalloc2::InstOrEdit::Inst(inst) => {
+                let allocs = alloc_output.inst_allocs(inst);
+                allocs.iter().enumerate().fold(
+                    Some(self.asm.opcodes[inst.index()].clone()),
+                    |inst, (opand_idx, alloc)| {
+                        inst.and_then(|mut inst| match alloc.kind() {
+                            regalloc2::AllocationKind::Reg => {
+                                inst.rewrite_opcode_operand_register(opand_idx, alloc.index());
+                                Some(inst)
+                            }
+                            regalloc2::AllocationKind::None => None,
+                            regalloc2::AllocationKind::Stack => {
+                                unreachable!("We have no opcodes which have stack use/defs.")
+                            }
+                        })
+                    },
+                )
+            }
+            regalloc2::InstOrEdit::Edit(regalloc2::Edit::Move { from, to }) => {
+                Some(if to.is_stack() && from.is_reg() {
+                    Opcode::Store(Operand::Stack(to.index()), Operand::Register(from.index()))
+                } else if to.is_reg() && from.is_stack() {
+                    Opcode::Load(Operand::Register(to.index()), Operand::Stack(from.index()))
+                } else if to.is_reg() && from.is_reg() {
+                    Opcode::Move(
+                        Operand::Register(to.index()),
+                        Operand::Register(from.index()),
+                    )
+                } else {
+                    unimplemented!("We can only spill to/from registers.")
+                })
             }
         }
+    }
 
-        let ret_set = HashSet::from_iter(
-            ssa.blocks
-                .iter()
-                .flat_map(|b| b.instrs.iter())
-                .enumerate()
-                .filter_map(|(idx, instr)| matches!(instr, Instruction::Ret(_)).then_some(idx)),
-        );
-        let branch_set = HashSet::from_iter(
-            ssa.blocks
-                .iter()
-                .flat_map(|b| b.instrs.iter())
-                .enumerate()
-                .filter_map(|(idx, instr)| {
-                    matches!(instr, Instruction::Br(_) | Instruction::Cbr(..)).then_some(idx)
-                }),
-        );
-        let new_use = |reg: &Register| {
-            regalloc2::Operand::any_use(regalloc2::VReg::new(
-                reg.0 as usize,
-                regalloc2::RegClass::Int,
-            ))
-        };
-        let new_def = |reg: &Register| {
-            regalloc2::Operand::any_def(regalloc2::VReg::new(
-                reg.0 as usize,
-                regalloc2::RegClass::Int,
-            ))
-        };
-        let moves = HashMap::from_iter(
-            ssa.blocks
-                .iter()
-                .flat_map(|b| b.instrs.iter())
-                .enumerate()
-                .filter_map(|(idx, instr)| {
-                    if let Instruction::Move(dst_reg, src_reg) = instr {
-                        Some((idx, (new_use(src_reg), new_def(dst_reg))))
-                    } else {
-                        None
-                    }
-                }),
-        );
-        let inst_operands = HashMap::from_iter(
-            ssa.blocks
-                .iter()
-                .flat_map(|b| b.instrs.iter())
-                .enumerate()
-                .map(|(idx, instr)| {
-                    let opands = match instr {
-                        Instruction::Add(a, b, c) => vec![new_def(a), new_use(b), new_use(c)],
-                        Instruction::Br(_) => vec![],
-                        Instruction::Cbr(a, _, _) => vec![new_use(a)],
-                        Instruction::Move(a, b) => vec![new_def(a), new_use(b)],
-                        Instruction::Movi(a, _) => vec![new_def(a)],
-                        Instruction::Ret(a) => vec![new_use(a)],
-                    };
-                    (idx, opands)
-                }),
-        );
-        let num_regs = ssa
-            .blocks
-            .iter()
-            .rev()
-            .flat_map(|b| b.instrs.iter().rev())
-            .find_map(|i| {
-                use std::cmp::max;
-                match i {
-                    Instruction::Add(a, b, c) => Some(max(a.0, max(b.0, c.0))),
-                    Instruction::Cbr(a, _, _) => Some(a.0),
-                    Instruction::Move(a, b) => Some(max(a.0, b.0)),
-                    Instruction::Movi(a, _) => Some(a.0),
-                    Instruction::Ret(a) => Some(a.0),
-                    _ => None,
-                }
-            })
-            .map(|r| (r + 1) as usize)
-            .unwrap();
+    fn new_use(reg: &Operand) -> regalloc2::Operand {
+        if let Operand::Register(r) = reg {
+            regalloc2::Operand::reg_use(regalloc2::VReg::new(*r as usize, regalloc2::RegClass::Int))
+        } else {
+            unreachable!("Generated operands must be registers at this stage.")
+        }
+    }
 
-        SsaMeta {
-            num_insts,
-            num_blocks,
-            entry_block,
-            block_instr_ranges,
-            block_succs,
-            block_preds,
-            dummy_block_params: Vec::new(),
-            ret_set,
-            branch_set,
-            moves,
-            inst_operands,
-            num_regs,
-            empty_block_set: Vec::new(),
+    fn new_def(reg: &Operand) -> regalloc2::Operand {
+        if let Operand::Register(r) = reg {
+            regalloc2::Operand::reg_def(regalloc2::VReg::new(*r as usize, regalloc2::RegClass::Int))
+        } else {
+            unreachable!("Generated operands must be registers at this stage.")
         }
     }
 }
 
-impl regalloc2::Function for SsaMeta {
+impl<'a> regalloc2::Function for AsmRegAllocator<'a> {
     fn num_insts(&self) -> usize {
-        self.num_insts
+        self.asm.opcodes.len()
     }
 
     fn num_blocks(&self) -> usize {
-        self.num_blocks
+        self.block_bounds.len()
     }
 
     fn entry_block(&self) -> regalloc2::Block {
@@ -869,19 +995,15 @@ impl regalloc2::Function for SsaMeta {
     }
 
     fn block_insns(&self, block: regalloc2::Block) -> regalloc2::InstRange {
-        self.block_instr_ranges.get(&block).cloned().unwrap()
+        self.block_bounds[block.index()]
     }
 
     fn block_succs(&self, block: regalloc2::Block) -> &[regalloc2::Block] {
-        self.block_succs
-            .get(&block.index())
-            .unwrap_or(&self.empty_block_set)
+        self.block_succs.get(&block.index()).unwrap()
     }
 
     fn block_preds(&self, block: regalloc2::Block) -> &[regalloc2::Block] {
-        self.block_preds
-            .get(&block.index())
-            .unwrap_or(&self.empty_block_set)
+        self.block_preds.get(&block.index()).unwrap()
     }
 
     fn block_params(&self, _block: regalloc2::Block) -> &[regalloc2::VReg] {
@@ -889,11 +1011,14 @@ impl regalloc2::Function for SsaMeta {
     }
 
     fn is_ret(&self, insn: regalloc2::Inst) -> bool {
-        self.ret_set.contains(&insn.index())
+        matches!(self.asm.opcodes[insn.index()], Opcode::Ret(_))
     }
 
     fn is_branch(&self, insn: regalloc2::Inst) -> bool {
-        self.branch_set.contains(&insn.index())
+        matches!(
+            self.asm.opcodes[insn.index()],
+            Opcode::Jmp(_) | Opcode::Jz(..)
+        )
     }
 
     fn branch_blockparams(
@@ -906,7 +1031,11 @@ impl regalloc2::Function for SsaMeta {
     }
 
     fn is_move(&self, insn: regalloc2::Inst) -> Option<(regalloc2::Operand, regalloc2::Operand)> {
-        self.moves.get(&insn.index()).cloned()
+        if let Opcode::Move(dst_reg, src_reg) = self.asm.opcodes[insn.index()] {
+            Some((Self::new_use(&src_reg), Self::new_def(&dst_reg)))
+        } else {
+            None
+        }
     }
 
     fn inst_operands(&self, insn: regalloc2::Inst) -> &[regalloc2::Operand] {
@@ -918,13 +1047,13 @@ impl regalloc2::Function for SsaMeta {
     }
 
     fn num_vregs(&self) -> usize {
-        self.num_regs
+        self.num_vregs
     }
 
     fn spillslot_size(&self, _regclass: regalloc2::RegClass) -> usize {
         1
     }
 }
-*/
+
 // }}}
 // -------------------------------------------------------------------------------------------------
